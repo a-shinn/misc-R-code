@@ -1,0 +1,263 @@
+---
+title: "L06 Resampling"
+subtitle: "Data Science II (STAT 301-2)"
+author: "Austin Shinn"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    highlight: "tango"
+---
+
+## Overview
+
+This lab covers material up to and including [10. Resampling for evaluating performance](https://www.tmwr.org/resampling.html) from [Tidy Modeling with R](https://www.tmwr.org/).
+
+### Load Packages & Set a Seed
+
+```{r, message=FALSE, warning=FALSE}
+# Load packages here!
+library(tidyverse)
+library(tidymodels)
+library(janitor)
+library(skimr)
+library(patchwork)
+
+# Set seed here!
+set.seed(77)
+```
+
+## Tasks
+
+### Task 1
+
+Use the tidyverse function `read_csv()` to load the `kc_house_data.csv` file from the `\data` directory into R. The data set contains 21,613 house sale prices (`price`) and other information for homes sold between May 2014 and May 2015 in King County, WA.
+
+Take a moment to read the variable definitions in `kc_house_data_codebook.txt`.
+
+```{r}
+kc_house <- read_csv("data/kc_house_data.csv") %>%
+  clean_names()
+```
+
+
+### Task 2
+
+We'll be attempting to predict the house sale `price`.
+
+Assess the distribution of `price`. Log-transform it, and assess the distribution again after transformation. From now on, use the log-transformed version.
+
+Perform a quick data assurance check using `skim_without_charts()` to see if there are any major issues. We're mostly checking for missing data problems, but also look for any obvious read-in issues.
+
+```{r}
+p1 <- ggplot(kc_house, aes(price)) +
+  geom_density()
+
+p2 <- ggplot(kc_house, aes(price)) +
+  geom_boxplot() 
+
+p2 / p1
+
+kc_house <- kc_house %>% mutate(price = log10(price))
+
+p3 <- ggplot(kc_house, aes(price)) +
+  geom_density()
+
+p4 <- ggplot(kc_house, aes(price)) +
+  geom_boxplot() 
+
+p4 / p3
+```
+
+The data is heavily right-skewed, so we log-transform it. After transforming, it looks a lot better.
+
+```{r}
+skim_without_charts(kc_house)
+
+```
+No missing data, no other apparent major issues.
+
+### Task 3
+
+Split the data into training and test sets. You can choose what proportion to use. Use stratified sampling. Verify that the training and test sets have the correct dimensions.
+
+```{r}
+kc_splits <- initial_split(kc_house, prop = 0.8, strata = price)
+dim(kc_splits)
+
+
+kc_train <- training(kc_splits)
+dim(kc_train)
+
+kc_test <- testing(kc_splits)
+dim(kc_test)
+```
+
+### Task 4
+
+Fold the training data. Use repeated V-fold cross-validation, with V = 5 and three repeats.
+
+```{r}
+kc_folds <- vfold_cv(kc_train, v = 5, repeats = 3)
+
+```
+
+### Task 5
+
+In your own words, **explain what we are doing** in Task 4. What is repeated V-fold cross-validation? Why should we use it, rather than simply fitting and testing models on the entire training set?
+
+V-fold cross-validation is a resampling method where the data (training set) is split into V number of folds. 1 fold is held out each time to estimate performance, as the rest of the folds are used to fit a model using whichever method is chosen (linear, random forest, etc). You end up with V number of models fit, and then they are averaged to make 1 averaged model. When it's repeated 3 times, the entire process is done 3 times (separating the folds, making the V models), meaning there are V * (number of repeats) model fits, and V * (number of repeats) number of performance metrics. Repeating the process allows you to average the statistics and reduce the standard error.
+
+This helps to avoid creating models that simply fit the training set well, but rather is good for predicting any future data.
+
+### Task 6
+
+Looking ahead, we plan on fitting 4 model types: **standard linear, random forest, ridge, and lasso**. All of our variables for prediction are numerical. The categorical variables are either binary (so we can leave them as they are) or those with multiple categories have been turned into indices for us. This means that we will be able to use the same recipe for all 4 models we plan to fit. **Create the following recipe:**
+
+1.  Predict `price` with all other variables
+2.  Do not use `id`, `date`, or `zipcode` as predictors
+3.  Log-transform `sqft_living, sqft_lot, sqft_above,  sqft_living15, sqft_lot15`
+4.  Center all predictors
+5.  Scale all predictors.
+
+```{r}
+kc_recipe <- recipe(price ~ . , data = kc_train) %>%
+  step_rm(id, date, zipcode) %>%
+  step_log(sqft_living, sqft_lot, sqft_above, sqft_living15, sqft_lot15, base = 10) %>%
+  step_normalize(all_predictors())
+```
+
+### Task 7
+
+Set up workflows for 4 models:
+
+1.  A linear regression (`linear_reg()`) with the `"lm"` engine,
+2.  A ridge regression (`linear_reg(penalty = 0.1, mixture = 0)`), with the `"glmnet"` engine,
+3.  A lasso regression (`linear_reg(penalty = 0.1, mixture = 1)`), with the `"glmnet"` engine, and
+4.  A random forest (`rand_forest()`) with the `"ranger"` engine setting `min_n = 10` and `trees = 600`. We will use the default value for `mtry`.
+
+See the challenge below for a fifth model to fit.
+
+```{r}
+# model 1
+linearm <- linear_reg() %>%
+  set_mode("regression") %>%
+  set_engine("lm")
+
+lin_workflow <- workflow() %>%
+  add_recipe(kc_recipe) %>%
+  add_model(linearm)
+
+# model 2
+ridgem <- linear_reg(penalty = 0.1, mixture = 0) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+ridge_workflow <- workflow() %>%
+  add_recipe(kc_recipe) %>%
+  add_model(ridgem)
+
+# model 3
+lassom <- linear_reg(penalty = 0.1, mixture = 1) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+
+lasso_workflow <- workflow() %>%
+  add_recipe(kc_recipe) %>%
+  add_model(lassom)
+
+# model 4
+rfm <- rand_forest(trees = 600, min_n = 10) %>%
+  set_mode("regression") %>%
+  set_engine("ranger")
+
+rf_workflow <- workflow() %>%
+  add_recipe(kc_recipe) %>%
+  add_model(rfm)
+
+```
+
+### Task 8
+
+Fit each of the four models created in Task 7 to the folded data.
+
+**IMPORTANT:** Some models, especially random forests, may take a while to run -- anywhere from 3 to 10 minutes. You should **NOT** re-run these models each time you knit. Instead, run them once, using an R script, and store your results. You should still include the code to run them when you knit, but set `eval = FALSE`. You may also need to use hidden R chunks (reading in saved files) to present your work.
+
+```{r}
+kc_control <- control_resamples(save_pred = TRUE)
+
+# model 1
+lin_fit_folds <- fit_resamples(
+  lin_workflow, resamples = kc_folds, control = kc_control)
+
+# model 2
+ridge_fit_folds <- fit_resamples(
+  ridge_workflow, resamples = kc_folds, control = kc_control)
+
+# model 3
+lasso_fit_folds <- fit_resamples(
+  lasso_workflow, resamples = kc_folds, control = kc_control)
+
+rf_fit_folds <- fit_resamples(
+  rf_workflow, resamples = kc_folds, control = kc_control)
+```
+
+### Task 9
+
+Use `collect_metrics()` to print the mean and standard errors of the performance metrics RMSE and *R*^2^ across all folds for each of the four models.
+
+Decide which of the 4 fitted models has performed the best. Explain why. *(Note: You should consider both the mean RMSE and its standard error.)*
+
+```{r}
+# model 1
+collect_metrics(lin_fit_folds)
+
+# model 2
+collect_metrics(ridge_fit_folds)
+
+# model 3
+collect_metrics(lasso_fit_folds)
+
+# model 4
+collect_metrics(rf_fit_folds)
+```
+
+The rf model has the lowest mean rmse and the standard error is about the same as other comparable models for rmse, so I would choose that.
+
+### Task 10
+
+Now that you've chosen a model, fit your chosen model to the entire training dataset (not to the folds).
+
+```{r}
+rf_training_fit <- rf_workflow %>%
+  fit(kc_train)
+```
+
+### Task 11
+
+Finally, with your fitted model, use `predict()`, `bind_cols()`, and `rmse()` to assess your model's performance on the **testing** data!
+
+Compare your model's testing RMSE to its average RMSE across folds.
+
+```{r}
+kc_metrics <- metric_set(rmse, rsq)
+
+rf_training_fit %>% 
+  predict(new_data = kc_test) %>%
+  bind_cols(kc_test %>% select(price)) %>%
+  kc_metrics(truth = price, estimate = .pred)
+```
+
+The testing RMSE is .0814, which is a bit higher than the model across folds (.0785).
+
+## Challenge
+
+**Required** for graduate students, but not for undergraduates (recommended though).
+
+### Additional model
+
+In addition to the 4 models we are using above, take the necessary steps to include a nearest neighbors model using between 15 and 50 `neighbors`. Leave other tuning parameters set at their defaults. Suggest looking over the documentation for `nearest_neighbors`().
+
+In a sentence or two, provide a quick overview of how a nearest neighbor model works.
+
+Is it a mechanistic or empirically driven model?
