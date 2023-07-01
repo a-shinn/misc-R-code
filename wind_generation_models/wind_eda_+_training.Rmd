@@ -1,0 +1,305 @@
+---
+title: "Greater Panhandle Wind Generation Data Analysis"
+subtitle: "Austin Shinn"
+output: html_notebook
+---
+Packages Used:
+```{r echo=TRUE}
+library(tidyverse)
+library(tidymodels)
+library(timetk)
+library(skimr)
+library(lubridate)
+library(janitor)
+library(modeltime)
+library(cowplot)
+library(plotly)
+```
+
+Pulling and cleaning data from Excel sheets:
+```{r}
+windcapacity_data <- read_csv("data/panhandlewindcapacity1.csv") %>%
+  clean_names() %>%
+  rename(amarillo_or_lubbock = closer_to_a_or_l)
+
+wind_data <- read_csv("data/windsampledata.csv") %>%
+  clean_names() %>%
+  select(-market_day, -year) %>%
+  mutate(
+         datetime = mdy_hm(datetime),
+         month = factor(month, levels = c("JANUARY", "FEBRUARY", "MARCH", "APRIL", "MAY", "JUNE", "JULY", "AUGUST", "SEPTEMBER", "OCTOBER", "NOVEMBER", "DECEMBER"))
+         ) %>%
+  distinct(datetime, .keep_all = TRUE)
+
+#wind_data <- wind_data_prelim[!(wind_data_prelim$year == 2017),] %>%
+#  select(-year)
+
+```
+
+Possibility: taking out 2017 data since the exact dates of construction of plants weren't available. ran it this way (taking out all 2017) and the produced models were less accurate. More data seems to outweigh the cons of slightly inaccurately adjusted data in regards to total possible production, so I ended up keeping all data from 2017 for model training.
+
+```{r echo=FALSE}
+### EDA
+skim(wind_data)
+```
+
+There is missing data for most predictors, but not to a great enough extent that it would be a problem if they were simply removed. the exception is precipitation for both Amarillo and Lubbock. Models will be run both with and without the few non-NA values to see if it's worth keeping/imputing.
+
+
+```{r}
+wind_data <- na.omit(wind_data)
+wind_data <- wind_data %>%
+             select(-contains("precip"))
+
+p1 <- wind_data %>%
+  plot_time_series(datetime, gr_panhandle_winddata, .title = "Greater Panhandle Wind Data over Time", .smooth = FALSE, .plotly_slider = TRUE)
+
+p2 <- wind_data %>%
+  ggplot(aes(gr_panhandle_winddata)) +
+  geom_histogram(bins = 30)
+
+# acceptable
+p3 <- wind_data %>%
+  ggplot(aes(temp_amarillo)) +
+  geom_histogram(bins = 30)
+
+# acceptable
+p4 <- wind_data %>%
+  ggplot(aes(temp_lubbock)) +
+  geom_histogram(bins = 30)
+
+# needs transformation?
+p5 <- wind_data %>%
+  ggplot(aes(dewpoint_amarillo)) +
+  geom_histogram(bins = 30)
+
+# needs transformation?
+p6 <- wind_data %>%
+  ggplot(aes(dewpoint_lubbock)) +
+  geom_histogram(bins = 30)
+
+p7 <- wind_data %>%
+  ggplot(aes(windspeed_amarillo)) +
+  geom_histogram(bins = 30)
+
+p8 <- wind_data %>%
+  ggplot(aes(windspeed_lubbock)) +
+  geom_histogram(bins = 30)
+
+plot_grid(p2,p3,p4,p5,p6,p7,p8)
+
+### both dewpoints appear to be bimodally distributed
+```
+The default scale of the histogram of wind speed in Amarillo looks way off. We can see that there is an outlier value in the mid-2000s for wind speed, which has to be an error in measurement or recording.
+
+There were 18 instances where the wind speed readings measured 2236.716, so we arrange wind_data by Amarillo wind speed in descending order then remove the first 18 readings, since we're removing columns with NA values anyway. With the misinput data removed, the Amarillo wind speed plot looks like this.
+```{r echo=TRUE}
+### The default scale of the histogram of wind speed in Amarillo looks way off. We can see that there is an outlier value in the mid-2000s for wind speed, which has to be an error in measurement or recording.
+
+wind_data <- wind_data %>% arrange(desc(windspeed_amarillo))
+
+wind_data
+### there were 18 instances where the readings measured 2236.716, so we arrange wind_data by Amarillo wind speed in descending order then remove the first 20 readings, since we're removing columns with NA values anyway.
+wind_data <- wind_data[18:38186,]
+
+### updated Amarillo wind speed plot
+wind_data %>%
+  ggplot(aes(windspeed_amarillo)) +
+  geom_histogram(bins = 30)
+
+plot_grid(p2,p3,p4,p5,p6,p9,p8)
+
+```
+Data is split into training and testing sets with an 80/20 split, which is suitable for larger datasets. k-fold cross validation with 5 folds and 3 repeats is used to keep the data from becoming too biased to the training set.
+
+Preprocessing steps:
+
+Near-zero variance filter removes variables that are sparse and unbalanced, meaning variables that may have basically the same value for all observations. I don't think this was necessary because the data is so varied, but I just kept it because it doesn't hurt.
+
+Yeo-Johnson transformation reduces skew of variables, which I used on all predictors for temperature, dewpoint temp, and wind speed. It's helpful for some, but not necessary for other types of models.
+
+Removed datetime variable because this is not a time-series forecasting machine learning model.
+
+All nominal / factor variables are changed to dummy variables (binary) which is better for many models.
+
+```{r echo=TRUE}
+## splitting the data. the dataset is large, so we can use a proportion like 80/20 for training/testing
+split <- initial_split(wind_data, prop = .8, strata = gr_panhandle_winddata)
+
+wind_cv <- vfold_cv(training(split), v = 5, repeats = 3, strata = gr_panhandle_winddata)
+
+###basic recipe skeleton, precipitation removed
+recipe <- training(split) %>%
+  recipe(gr_panhandle_winddata ~ .) %>%
+  step_nzv(all_predictors()) %>%
+  step_YeoJohnson(contains("temp"), contains("dewpoint"), contains("windspeed")) %>%
+  step_rm(datetime, contains("precipitation"), skip = TRUE) %>%
+  step_dummy(all_nominal(), one_hot = TRUE)
+
+bake(prep(recipe), new_data = training(split))
+
+```
+
+```{r}
+#1. linear  regression model
+linear_model <- linear_reg(mode = "regression") %>%
+    set_engine("lm")
+
+# 2. nearest neighbors
+knn_model <- nearest_neighbor(mode = "regression",
+                              neighbors = tune()) %>%
+  set_engine("kknn")
+
+# 3. random forest
+rf_model <- rand_forest(mode = "regression",
+                        min_n = tune(),
+                        mtry = tune()) %>% 
+  set_engine("ranger")
+
+# 4. boosted tree
+bt_model <- boost_tree(mode = "regression",
+                       mtry = tune(),
+                       min_n = tune(),
+                       learn_rate = tune()) %>%
+  set_engine("xgboost")
+
+# 5. support vector machine (polynomial)
+svmp_model <- svm_poly(mode = "regression",
+                      cost = tune(),
+                      degree = tune(),
+                      scale_factor = tune()) %>%
+  set_engine("kernlab")
+
+# 6. support vector machine (radial)
+svmr_model <- svm_rbf(mode = "regression",
+                      cost = tune(),
+                      rbf_sigma = tune()) %>%
+  set_engine("kernlab")
+
+# 7. single layer neural network
+slnn_model <- mlp(mode = "regression",
+                  hidden_units = tune(),
+                  penalty = tune()) %>%
+  set_engine("nnet")
+
+# 8. multivariate adaptive regression splines
+mars_model <- mars(mode = "regression",
+                   num_terms = tune(),
+                   prod_degree = tune()) %>%
+  set_engine("earth")
+
+### creating regular grids for the models. 5 levels for each hyper-parameter set in the models above.
+### random forest and boosted tree models have mtry between 2 and 10.
+rf_parameters <- parameters(rf_model) %>% 
+  update(mtry = mtry(c(2,10)))
+
+bt_params <- parameters(bt_model) %>% 
+  update(mtry = mtry(c(2,10)),
+         learn_rate = learn_rate(c(-5, -.2)))
+
+mars_params <- parameters(mars_model) %>% 
+  update(num_terms = num_terms(c(2,320)))
+
+knn_grid <- grid_regular(parameters(knn_model), levels = 5)
+rf_grid <- grid_regular(rf_parameters, levels = 5)
+bt_grid <- grid_regular(bt_params, levels = 5)
+### svmp_grid <- grid_regular(parameters(svmp_model), levels = 5)
+### svmr_grid <- grid_regular(parameters(svmr_model), levels = 5)
+slnn_grid <- grid_regular(parameters(slnn_model), levels = 5)
+mars_grid <- grid_regular(mars_params, levels = 5)
+
+
+linear_workflow <- workflow() %>% 
+  add_model(linear_model) %>% 
+  add_recipe(recipe)
+
+knn_workflow <- workflow() %>%
+  add_model(knn_model) %>%
+  add_recipe(recipe)
+
+rf_workflow <- workflow() %>%
+  add_model(rf_model) %>%
+  add_recipe(recipe)
+
+bt_workflow <- workflow() %>% 
+  add_model(bt_model) %>% 
+  add_recipe(recipe)
+
+slnn_workflow <- workflow() %>% 
+  add_model(slnn_model) %>% 
+  add_recipe(recipe)
+
+mars_workflow <- workflow() %>%
+  add_model(mars_model) %>%
+  add_recipe(recipe)
+```
+
+Models tested and results (for both optimal hyperparameters and actual model performance):
+
+k-nearest neighbors best model: neighbors = 11, RMSE = 601.17
+
+random forest best model: mtry = 6, min_n = 2, RMSE = 546.40
+
+boosted tree: mtry = 10, min_n = 11, learn_rate = .631, RMSE = 587.55
+
+single-layer neural network: hidden units = 5, penalty = 1.00, RMSE = 836.2845
+
+mars model: number of terms = 81, prod_degree = 2, RMSE = 606.0637
+
+The best performing model by RMSE (and also R^2) was the random forest model. The following is a graph of predicted values from the model and actual values from the dataset (use the slider to zoom into a specific timeframe). Overall, I would say the model does a good job of predicting the trends of the actual data, and part of the model error was in events that could not be predicted. At least a couple times, actual value falls to near-zero or actually zero when the model predicts a higher number, which I would assume is equipment failure or maintainence. The variables used in the model are also ones readily available from public weather forecasting data, which makes it realistic in practical usage for wind generation forecasting. Inclusion of additional relevant variables may further increase model accuracy.
+
+
+```{r echo=TRUE}
+### after running tuning script
+show_best(knn_tune, metric = "rmse", n = 5)
+show_best(rf_tune, metric = "rmse", n = 5)
+show_best(bt_tune, metric = "rmse", n = 5)
+show_best(slnn_tune, metric = "rmse", n = 5)
+show_best(mars_tune, metric = "rmse", n = 5)
+
+### random forest model is chosen as best out of the other models, based on both R^2 value and RMSE
+rf_workflow_tuned <- rf_workflow %>% 
+  finalize_workflow(select_best(rf_tune, metric = "rmse"))
+
+rf_results <- fit(rf_workflow_tuned, training(split))
+
+yes <- predict(rf_results, new_data = testing(split), type = "numeric") %>% 
+  bind_cols(testing(split) %>% select(datetime))
+
+rf_preds <- tibble(DateTime = testing(split)$datetime, Predicted = yes$.pred)
+
+rf_preds
+
+autoplot(rf_tune, metric = "rmse")
+
+combination <- bind_cols(testing(split), rf_preds)
+
+rf_preds %>% plot_time_series(DateTime, Predicted)
+
+ggplot() + 
+  geom_line(data = rf_preds, aes(x = DateTime, y = Predicted), color = "red") +
+  geom_line(data = testing(split), aes(x = datetime, y = gr_panhandle_winddata), color = "blue")
+
+comparison <- combination %>%
+  select(datetime, Predicted, gr_panhandle_winddata) %>%
+  rename("Predicted Data" = Predicted,
+         "Actual Values" = gr_panhandle_winddata)
+
+TSstudio::ts_plot(comparison,
+                  title = "Predicted vs. Actual Data",
+                  slider = TRUE,
+                  Xgrid = TRUE,
+                  Ygrid = TRUE
+                  )
+```
+
+
+
+
+
+
+
+
+
+
+
