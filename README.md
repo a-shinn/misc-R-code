@@ -1,3 +1,3 @@
 # misc-R-code
 
-Samples of previous R code from coursework / independent project. Focus on data analysis & machine learning in R
+Samples of previous R code. Focus on data analysis & machine learning in R
